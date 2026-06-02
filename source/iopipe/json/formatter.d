@@ -272,7 +272,6 @@ private:
     void putEscapedStr(const(char)[] s)
     {
         // Add any escapes necessary.
-        // TODO: this does not handle single quoted strings with JSON5
         import std.range : put;
         auto r = &putStrImpl!relOnWrite;
         const(char)[2] quoterep = ['\\', currentQuoteChar[0]];
@@ -421,6 +420,8 @@ public:
     static if(JSON5)
         void addMemberName(T)(T memberName, MemberNameStyle style)
     {
+        if (!inObj || (_state != State.First && _state != State.Member))
+            throw new JSONIopipeException("cannot add member name when not inside object or at member state");
         final switch(style) with (MemberNameStyle) {
         case SingleQuote:
             beginString('\'');
