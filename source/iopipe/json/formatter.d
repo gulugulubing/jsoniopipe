@@ -3,8 +3,7 @@ module iopipe.json.formatter;
 public import iopipe.json.common;
 
 import iopipe.traits : isIopipe, WindowType;
-import iopipe.bufpipe; 
-import iopipe.json.serialize : jsonEscapeSubstitutions;
+import iopipe.bufpipe;
 
 import std.bitmanip : BitArray;
 import std.exception : enforce;
@@ -14,6 +13,65 @@ import std.regex;
 import std.algorithm.iteration : substitute;
 import std.algorithm.searching : startsWith, endsWith;
 import std.format;
+
+/** Eponymous template that generates an argument list for std.algorithm.substitute to correctly escape json strings
+ * Result:
+ *      AliasSeq!("<char>", "<escapesequence>", "<char>", "<escapesequence>", ...);
+ */
+package template jsonEscapeSubstitutions()
+{
+    import std.algorithm.iteration;
+    import std.range;
+    import std.ascii: ControlChar;
+
+    // Control characters [0,31 aka 0x1f] + 2 special characters '"' and '\'
+    private enum charactersToEscape = chain(only('\\'), iota(0x1f + 1));
+
+    private struct JsonEscapeMapping {
+        char chr;
+        string escapeSequence;
+    }
+
+    /* Special characters we have to (in case of '"' and '\') per the spec or want to escape seperately for readability
+    * Everything else gets converted to the "\uxxxx" unicode escape
+    */
+    private enum JsonEscapeMapping[6] JSON_ESCAPES = [
+        {'\\', `\\`},
+        {ControlChar.bs, `\b`},
+        {ControlChar.lf, `\n`},
+        {ControlChar.cr, `\r`},
+        {ControlChar.tab, `\t`},
+        {ControlChar.ff, `\f`},
+    ];
+
+    private JsonEscapeMapping escapeSingleChar(int c)
+    {
+        import std.format;
+        switch(c)
+        {
+            static foreach(e; JSON_ESCAPES)
+            {
+                case e.chr:
+                    return e;
+            }
+            default:
+                return JsonEscapeMapping(cast(char)c, format!`\u%04x`(c));
+        }
+    }
+
+    // Convert struct to AliasSeq with correct types so it can be used as parameters of a function
+    private template UnpackStruct(JsonEscapeMapping jem)
+    {
+        import std.conv: to;
+        // Must convert char to string for use with substitute
+        enum string staticCast(char c) = c.to!string;
+        enum string staticCast(string s) = s;
+        alias UnpackStruct = staticMap!(staticCast, jem.tupleof);
+    }
+
+    import std.meta;
+    private alias jsonEscapeSubstitutions = staticMap!(UnpackStruct, aliasSeqOf!(charactersToEscape.map!escapeSingleChar));
+}
 
 /**
  * Controls the whitespace placed around the colon separator between a JSON
@@ -68,7 +126,7 @@ enum KeywordValue : string {
 /**
  * Represents the current position in the JSON output state machine.
  * Exposed via the `state` property so that formatters layered on top of
- * `JSONOutputter` can make spacing decisions without duplicating state tracking.
+ * `JSONWriter` can make spacing decisions without duplicating state tracking.
  */
 enum State : ubyte
 {
@@ -97,12 +155,13 @@ enum State : ubyte
  *   JSON5 = When `true`, enables JSON5 extensions such as single-quoted
  *           strings, bare symbol keys, trailing commas, and comment output.
  */
-struct JSONOutputter(Chain, bool JSON5 = false)
+struct JSONWriter(Chain, ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes, bool JSON5 = false)
 if (isIopipe!Chain)
 {
 private:
     Chain* outputChain;
     size_t pos = 0;
+    size_t nWritten = 0;
     static if(JSON5)
         char[1] currentQuoteChar = [0];
     else
@@ -197,20 +256,24 @@ private:
         return item.token == JSONToken.Symbol && pos == s.length;
     }
 
-    void putStr(const(char)[] s)
+    void putStrImpl(ReleaseOnWrite row)(const(char)[] s)
     {
-        import std.stdio;
-        outputChain.ensureElems(pos + s.length);
-        outputChain.window[pos .. pos + s.length] = s;
-        pos += s.length;
+        auto n = outputChain.writeBuf!row(s, pos);
+        nWritten += n;
+        static if(row)
+            // everything was flushed.
+            pos = 0;
+        else
+            pos += n;
     }
+
+    alias putStr = putStrImpl!relOnWrite;
 
     void putEscapedStr(const(char)[] s)
     {
         // Add any escapes necessary.
-        // TODO: this does not handle single quoted strings with JSON5
         import std.range : put;
-        auto r = &putStr;
+        auto r = &putStrImpl!relOnWrite;
         const(char)[2] quoterep = ['\\', currentQuoteChar[0]];
         // TODO: see if I can write this better, I don't like the string casts, but the compiler can't handle it otherwise.
         put(r, s.substitute(jsonEscapeSubstitutions!(), cast(string)currentQuoteChar[], cast(string)quoterep[]));
@@ -218,12 +281,15 @@ private:
 
 public:
 
+    /// Boolean informs whether the writer supports JSON5 output
+    enum hasJSON5 = JSON5;
+
     /**
-     * Construct a `JSONOutputter` that writes into `chain` starting at `pos`.
+     * Construct a `JSONWriter` that writes into `chain` starting at `pos`.
      *
      * Params:
-     *   chain = The output iopipe to write JSON into. The outputter holds a
-     *           pointer to this chain, so it must outlive the outputter.
+     *   chain = The output iopipe to write JSON into. The writer holds a
+     *           pointer to this chain, so it must outlive the writer.
      *   pos   = Initial write offset within `chain`'s window.
      */
     this(ref Chain chain, size_t pos = 0)
@@ -242,6 +308,8 @@ public:
     bool inObj() const @property nothrow => stackLen == 0 ? false : stack[stackLen - 1];
     /// The number of currently open (not yet closed) objects and arrays.
     size_t depth() const @property nothrow => stackLen;
+    /// The number of characters written by this object in total
+    size_t totalWritten() const @property nothrow => nWritten;
 
     /**
      * Write `{` to the output and push a new object onto the aggregate stack.
@@ -329,7 +397,7 @@ public:
      * Params:
      *   memberName = The member name to write.
      */
-    void addMemberName(const(char)[] memberName)
+    void addMemberName(T)(T memberName)
     {
         if (!inObj || (_state != State.First && _state != State.Member))
             throw new JSONIopipeException("cannot add member name when not inside object or at member state");
@@ -350,8 +418,10 @@ public:
      *   style      = How to quote the member name.
      */
     static if(JSON5)
-        void addMemberName(const(char)[] memberName, MemberNameStyle style)
+        void addMemberName(T)(T memberName, MemberNameStyle style)
     {
+        if (!inObj || (_state != State.First && _state != State.Member))
+            throw new JSONIopipeException("cannot add member name when not inside object or at member state");
         final switch(style) with (MemberNameStyle) {
         case SingleQuote:
             beginString('\'');
@@ -405,13 +475,15 @@ PUT_SYMBOL:
             formattedWrite(&putEscapedStr, "%s", data);
         }
         else
-        { 
+        {
             static if (mode == StringMode.Validate)
             {
                 // Write the string as-is, including a termination quote character.
                 // Then we validate the resulting data, and trim off the quote character.
                 size_t origLen = pos;
-                formattedWrite(&putStr, "%s%c", data, currentQuoteChar[0]);
+                // putStr must not release for this validation, as we need to check it.
+                auto output = &putStrImpl!(ReleaseOnWrite.no);
+                output.formattedWrite("%s%c", data, currentQuoteChar[0]);
                 import iopipe.json.parser;
                 size_t curPos = 0;
                 JSONParseHint hint;
@@ -425,6 +497,9 @@ PUT_SYMBOL:
                 }
                 // we wrote the final quote character to validate the string data, ignore it.
                 --pos;
+                static if(relOnWrite)
+                    // we overrode the release on write, need to follow the directions.
+                    flushWritten();
             }
             else
             {
@@ -471,7 +546,7 @@ PUT_SYMBOL:
         // save the original position
         auto origPos = pos;
         formattedWrite(&putStr, format, value);
-        
+
         // validate the number by parsing it.
         // TODO: fill this out
 
@@ -509,13 +584,19 @@ PUT_SYMBOL:
     }
 
     /**
-     * Write the `,` separator between members of an object or array.
-     * Throws `JSONIopipeException` if a complete value inside an aggregate has not just been written.
+     * Prepare for writing the next member of an aggregate. If called for the
+     * first member, this is a no-op (and is not required). For subsequent
+     * members, it writes the separator comma.
+     *
+     * Throws `JSONIopipeException` if not in a state where you can start a new aggregate member.
      */
-    void addComma()
+    void nextMember()
     {
+        if(_state == State.First)
+            // special case, to avoid having to track whether a comma is needed.
+            return;
         if(_state != State.Comma)
-            throw new JSONIopipeException(format("Tried to add a comma when unexpected (state = %s)", _state));
+            throw new JSONIopipeException(format("Tried to start a new member with unexpected (state = %s)", _state));
 
         putStr(",");
         _state = State.Member;
@@ -575,10 +656,23 @@ PUT_SYMBOL:
 }
 
 /**
- * JSON writer that wraps `JSONOutputter` and adds indentation, newlines, and
+ * Construct a `JSONWriter` for `chain`.
+ *
+ * Params:
+ *   JSON5         = When `true`, enables JSON5 extensions.
+ *   chain         = The output iopipe to write JSON into.
+ *   pos           = Initial write offset within `chain`'s window.
+ */
+auto jsonWriter(bool JSON5 = false, ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes, Chain)(ref Chain chain, size_t pos = 0)
+{
+    return JSONWriter!(Chain, relOnWrite, JSON5)(chain, pos);
+}
+
+/**
+ * JSON formatter that wraps `JSONWriter` and adds indentation, newlines, and
  * configurable colon spacing to produce human-readable output. Additional
  * whitespace can be added as needed. The public interface mirrors
- * `JSONOutputter`.
+ * `JSONWriter`.
  *
  * Use `jsonFormatter` for IFTI construction.
  *
@@ -586,31 +680,34 @@ PUT_SYMBOL:
  *   Chain = A text iopipe to write JSON into.
  *   JSON5 = When `true`, enables JSON5 extensions.
  */
-struct JSONStandardFormatter(Chain, bool JSON5 = false)
+struct JSONStandardFormatter(Chain, ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes, bool JSON5 = false)
 if (isIopipe!Chain)
 {
 private:
 
-    JSONOutputter!(Chain, JSON5) outputter;
+    JSONWriter!(Chain, relOnWrite, JSON5) writer;
     int indent;
     ColonSpacing colonSpacing;
 
     void putIndent(size_t depth)
     {
-        outputter.addWhitespace("\n");
+        writer.addWhitespace("\n");
         // TODO: make this less cumbersome
         import std.range : repeat;
-        outputter.addWhitespace(repeat(' ', indent * depth));
+        writer.addWhitespace(repeat(' ', indent * depth));
     }
 
     void spacingBeforeValue()
     {
         // if starting a member, then output index. otherwise (after colon), do not.
-        if(outputter.state == State.Member || state == State.First)
-            putIndent(outputter.depth);
+        if(writer.state == State.Member || state == State.First)
+            putIndent(writer.depth);
     }
 
 public:
+    /// Boolean informs whether the writer supports JSON5 output
+    enum hasJSON5 = JSON5;
+
     /**
      * Construct a `JSONStandardFormatter` that writes into `chain`.
      *
@@ -622,21 +719,23 @@ public:
      */
     this(ref Chain chain, size_t pos = 0, int indent = 4, ColonSpacing colonSpacing = ColonSpacing.After) {
         assert(indent >= 0);
-        this.outputter = typeof(outputter)(chain, pos);
+        this.writer = typeof(writer)(chain, pos);
         this.indent = indent;
         this.colonSpacing = colonSpacing;
     }
 
     /// The current state of the output state machine.
-    State state() const @property nothrow => outputter.state();
+    State state() const @property nothrow => writer.state();
     /// The number of characters written into the output chain's window so far.
-    size_t position() const @property nothrow => outputter.position();
+    size_t position() const @property nothrow => writer.position();
     /// A slice of the output chain's window containing all characters written so far.
-    auto window() => outputter.window();
+    auto window() => writer.window();
     /// `true` when the innermost open aggregate is an object.
-    bool inObj() const @property nothrow => outputter.inObj();
+    bool inObj() const @property nothrow => writer.inObj();
     /// The number of currently open (not yet closed) objects and arrays.
-    size_t depth() const @property nothrow => outputter.depth();
+    size_t depth() const @property nothrow => writer.depth();
+    /// The number of characters written by this object in total
+    size_t totalWritten() const @property nothrow => writer.totalWritten();
 
     /**
      * Write `{` to the output and push a new object onto the aggregate stack.
@@ -644,7 +743,7 @@ public:
      */
     void beginObject() {
         spacingBeforeValue();
-        outputter.beginObject();
+        writer.beginObject();
     }
 
     /**
@@ -653,7 +752,7 @@ public:
      */
     void beginArray() {
         spacingBeforeValue();
-        outputter.beginArray();
+        writer.beginArray();
     }
 
     /**
@@ -665,8 +764,8 @@ public:
      */
     void endAggregate() {
         import std.algorithm : max;
-        putIndent(max(outputter.depth, 1) - 1);
-        outputter.endAggregate();
+        putIndent(max(writer.depth, 1) - 1);
+        writer.endAggregate();
     }
 
     /**
@@ -677,7 +776,7 @@ public:
     void beginString()
     {
         spacingBeforeValue();
-        outputter.beginString();
+        writer.beginString();
     }
 
     /**
@@ -693,7 +792,7 @@ public:
     void beginString(char quoteChar)
     {
         spacingBeforeValue();
-        outputter.beginString(quoteChar);
+        writer.beginString(quoteChar);
     }
 
 
@@ -706,10 +805,10 @@ public:
      * Params:
      *   memberName = The member name to write.
      */
-    void addMemberName(const(char)[] memberName)
+    void addMemberName(T)(T memberName)
     {
         spacingBeforeValue();
-        outputter.addMemberName(memberName);
+        writer.addMemberName(memberName);
     }
 
     /**
@@ -724,10 +823,10 @@ public:
      *   style      = How to quote the member name.
      */
     static if(JSON5)
-    void addMemberName(const(char)[] memberName, MemberNameStyle style)
+    void addMemberName(T)(T memberName, MemberNameStyle style)
     {
         spacingBeforeValue();
-        outputter.addMemberName(memberName, style);
+        writer.addMemberName(memberName, style);
     }
 
     /**
@@ -742,14 +841,14 @@ public:
      *   mode = Controls how `data` is interpreted; see `StringMode`.
      *   data = The content to append, converted to string data.
      */
-    void addStringData(StringMode mode = StringMode.AddEscapes, T)(T data) => outputter.addStringData!mode(data);
+    void addStringData(StringMode mode = StringMode.AddEscapes, T)(T data) => writer.addStringData!mode(data);
 
     /**
      * Write the closing quote character for the current string and transition
      * to the next expected state.
      * Throws `JSONIopipeException` if not currently inside a string.
      */
-    void endString() => outputter.endString();
+    void endString() => writer.endString();
 
     /**
      * Write a numeric value to the output.
@@ -763,7 +862,7 @@ public:
     void addNumber(T)(T value, string format = "%s")
     {
         spacingBeforeValue();
-        outputter.addNumber(value, format);
+        writer.addNumber(value, format);
     }
 
     /**
@@ -776,7 +875,7 @@ public:
     void addKeywordValue(KeywordValue value)
     {
         spacingBeforeValue();
-        outputter.addKeywordValue(value);
+        writer.addKeywordValue(value);
     }
 
     /**
@@ -789,23 +888,26 @@ public:
         final switch(colonSpacing) with(ColonSpacing)
         {
         case None:
-            outputter.addColon();
+            writer.addColon();
             break;
         case Both:
-            outputter.addWhitespace(" ");
+            writer.addWhitespace(" ");
             goto case After;
         case After:
-            outputter.addColon();
-            outputter.addWhitespace(" ");
+            writer.addColon();
+            writer.addWhitespace(" ");
             break;
         }
     }
 
     /**
-     * Write the `,` separator between members of an object or array.
-     * Throws `JSONIopipeException` if a complete value inside an aggregate has not just been written.
+     * Prepare for writing the next member of an aggregate. If called for the
+     * first member, this is a no-op (and is not required). For subsequent
+     * members, it writes the separator comma.
+     *
+     * Throws `JSONIopipeException` if not in a state where you can start a new aggregate member.
      */
-    void addComma() => outputter.addComma();
+    void nextMember() => writer.nextMember();
 
     /**
      * Write raw whitespace into the output between tokens, in addition to
@@ -816,7 +918,7 @@ public:
      *   validate = When `true`, validates that `data` contains only whitespace characters.
      *   data     = The whitespace characters to write.
      */
-    void addWhitespace(bool validate = false, T)(T data) => outputter.addWhitespace!validate(data);
+    void addWhitespace(bool validate = false, T)(T data) => writer.addWhitespace!validate(data);
 
     /**
      * JSON5 only. Write a raw comment into the output between tokens.
@@ -827,14 +929,14 @@ public:
      *   commentData = The comment text to write, including the comment delimiters.
      */
     static if(JSON5)
-        void addComment(bool validate = false, T)(T commentData) => outputter.addComment!validate(commentData);
+        void addComment(bool validate = false, T)(T commentData) => writer.addComment!validate(commentData);
 
     /**
      * Release all characters written so far from the output chain's window,
      * allowing the underlying buffer to reclaim that space. For push iopipes,
      * this queues the data for writing to the output stream.
      */
-    void flushWritten() => outputter.flushWritten();
+    void flushWritten() => writer.flushWritten();
 }
 
 /**
@@ -847,9 +949,18 @@ public:
  *   indent        = Number of spaces per indentation level.
  *   colonSpacing  = Whitespace style around the `:` separator.
  */
-auto jsonFormatter(bool JSON5 = false, Chain)(ref Chain chain, size_t pos = 0, int indent=4, ColonSpacing colonSpacing = ColonSpacing.After)
+template jsonFormatter(bool JSON5 = false, ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes)
 {
-    return JSONStandardFormatter!(Chain, JSON5)(chain, pos, indent, colonSpacing);
+    auto jsonFormatter(Chain)(ref Chain chain, size_t pos = 0, int indent=4, ColonSpacing colonSpacing = ColonSpacing.After)
+    {
+        return JSONStandardFormatter!(Chain, relOnWrite, JSON5)(chain, pos, indent, colonSpacing);
+    }
+}
+
+version(unittest)
+{
+    private alias jsonFormatterUT = jsonFormatter!(false, ReleaseOnWrite.no);
+    private alias json5FormatterUT = jsonFormatter!(true, ReleaseOnWrite.no);
 }
 
 unittest
@@ -857,11 +968,9 @@ unittest
     import iopipe.traits : isIopipe;
     import iopipe.bufpipe : ensureElems;
     import std.string : strip;
-    import std.stdio : writeln;
-
     auto chain = bufd!char();
 
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     fmt.beginObject();
     fmt.addMemberName("a");
@@ -873,7 +982,7 @@ unittest
     assert(s == "{\n    \"a\": 1\n}");
 
     // do the same without formatting.
-    auto fmt2 = JSONOutputter!(typeof(chain))(chain);
+    auto fmt2 = chain.jsonWriter!(false, ReleaseOnWrite.no);
 
     fmt2.beginObject();
     fmt2.addMemberName("a");
@@ -889,13 +998,13 @@ unittest
 {
     // Simple array: [1,2,3]
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     fmt.beginArray();
     fmt.addNumber(1);
-    fmt.addComma();
+    fmt.nextMember();
     fmt.addNumber(2);
-    fmt.addComma();
+    fmt.nextMember();
     fmt.addNumber(3);
     fmt.endAggregate();
 
@@ -907,7 +1016,7 @@ unittest
 {
     // String with escapes and single‑quote behavior
     auto chain = bufd!char;
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     // double‑quoted: inner " and \ should be escaped
     fmt.beginString();
@@ -918,7 +1027,7 @@ unittest
     assert(s == `"He said: \"hi\" \\ test"`);
 
     // reset chain, now test single‑quoted: inner ' must be escaped as \'
-    auto fmt2 = chain.jsonFormatter!true;
+    auto fmt2 = chain.json5FormatterUT;
 
     fmt2.beginString('\'');
     fmt2.addStringData(`It's ok`);
@@ -932,7 +1041,7 @@ unittest
 {
     // addEscapes: real newline becomes literal "\n" in JSON
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     fmt.beginString();
     fmt.addStringData("line1\nline2"); // contains an actual newline character
@@ -952,7 +1061,7 @@ unittest
     auto chain = bufd!char();
 
     // 1) Double‑quoted string with valid escapes should pass unchanged
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
     fmt.beginString();
     fmt.addStringData!(StringMode.Validate)(`He said: \"hi\" \\ test`);
     fmt.endString();
@@ -961,22 +1070,22 @@ unittest
     assert(s == `"He said: \"hi\" \\ test"`);
 
     // 2) Invalid escape ("\q") should throw in validate mode
-    auto fmt2 = chain.jsonFormatter;
+    auto fmt2 = chain.jsonFormatterUT;
     fmt2.beginString();
     assertThrown!JSONIopipeException(fmt2.addStringData!(StringMode.Validate)(`He said: \q`));
 
     // 3) Lone backslash at end should throw in validate mode
-    auto fmt3 = chain.jsonFormatter;
+    auto fmt3 = chain.jsonFormatterUT;
     fmt3.beginString();
     assertThrown!JSONIopipeException(fmt3.addStringData!(StringMode.Validate)(`oops \`));
 
     // 4) Unescaped quote should throw in validate mode
-    auto fmt4 = chain.jsonFormatter;
+    auto fmt4 = chain.jsonFormatterUT;
     fmt4.beginString();
     assertThrown!JSONIopipeException(fmt4.addStringData!(StringMode.Validate)(`He said: "hi"`));
 
     // 5) Single‑quoted validate: \' is allowed, bare ' is not
-    auto fmt5 = chain.jsonFormatter!true;
+    auto fmt5 = chain.json5FormatterUT;
     fmt5.beginString('\'');
     fmt5.addStringData!(StringMode.Validate)(`It\'s ok`);
     fmt5.endString();
@@ -984,7 +1093,7 @@ unittest
     s = fmt5.window;
     assert(s == `'It\'s ok'`);
 
-    auto fmt6 = chain.jsonFormatter!true;
+    auto fmt6 = chain.json5FormatterUT;
     fmt6.beginString('\'');
     assertThrown!JSONIopipeException(fmt6.addStringData!(StringMode.Validate)(`It's bad`));
 }
@@ -997,29 +1106,29 @@ unittest
     auto chain = bufd!char();
 
     // 1) All standard single-character escapes should be accepted
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
     fmt.beginString();
     fmt.addStringData!(StringMode.Validate)(`\" \\ \/ \b \f \n \r \t`);
     fmt.endString();
 
     // 2) Valid \u escape should be accepted
-    auto fmt2 = chain.jsonFormatter;
+    auto fmt2 = chain.jsonFormatterUT;
     fmt2.beginString();
     fmt2.addStringData!(StringMode.Validate)(`\u00AF`);
     fmt2.endString();
 
     // 3) Too-short \u escape should throw
-    auto fmt3 = chain.jsonFormatter;
+    auto fmt3 = chain.jsonFormatterUT;
     fmt3.beginString();
     assertThrown!JSONIopipeException(fmt3.addStringData!(StringMode.Validate)(`\u12`));
 
     // 4) \u escape with non-hex digits should throw
-    auto fmt4 = chain.jsonFormatter;
+    auto fmt4 = chain.jsonFormatterUT;
     fmt4.beginString();
     assertThrown!JSONIopipeException(fmt4.addStringData!(StringMode.Validate)(`\u12xz`));
 
     // 5) Bare control character (< 0x20) should throw
-    auto fmt5 = chain.jsonFormatter;
+    auto fmt5 = chain.jsonFormatterUT;
     fmt5.beginString();
     string bad = "ok" ~ "\x01"; // embed a real control char 0x01
     assertThrown!JSONIopipeException(fmt5.addStringData!(StringMode.Validate)(bad));
@@ -1029,13 +1138,13 @@ unittest
 {
     // Keywords: null/true/false
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     fmt.beginArray();
     fmt.addKeywordValue(KeywordValue.Null);
-    fmt.addComma();
+    fmt.nextMember();
     fmt.addKeywordValue(KeywordValue.True);
-    fmt.addComma();
+    fmt.nextMember();
     fmt.addKeywordValue(KeywordValue.False);
     fmt.endAggregate();
 
@@ -1049,7 +1158,7 @@ unittest
     import std.exception : assertThrown;
 
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     assertThrown!JSONIopipeException(fmt.endAggregate());
 }
@@ -1060,11 +1169,11 @@ unittest
     import std.exception : assertThrown;
 
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     assertThrown!JSONIopipeException(fmt.addMemberName("a"));
 
-    auto fmt2 = chain.jsonFormatter;
+    auto fmt2 = chain.jsonFormatterUT;
     fmt2.beginArray();
     assertThrown!JSONIopipeException(fmt2.addMemberName("a"));
 
@@ -1074,7 +1183,7 @@ unittest
 {
     // Test adding member name via beginString calls
     auto chain = bufd!char;
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     fmt.beginObject();
     fmt.beginString();
@@ -1094,7 +1203,7 @@ unittest
     import std.exception : assertThrown;
 
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     fmt.beginString();
     assertThrown!JSONIopipeException(fmt.beginString());
@@ -1106,7 +1215,7 @@ unittest
     import std.exception : assertThrown;
 
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     assertThrown!JSONIopipeException(fmt.addStringData("oops"));
 }
@@ -1117,7 +1226,7 @@ unittest
     import std.exception : assertThrown;
 
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     assertThrown!JSONIopipeException(fmt.endString());
 }
@@ -1126,21 +1235,21 @@ unittest
 {
     // JSON5 options
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter!true;
+    auto fmt = chain.json5FormatterUT;
 
-    
+
     fmt.beginObject();
     fmt.addMemberName("a", MemberNameStyle.SingleQuote);
     fmt.addColon();
     fmt.addNumber(1);
-    fmt.addComma();
+    fmt.nextMember();
     fmt.addMemberName("b", MemberNameStyle.Symbol);
     fmt.addColon();
     fmt.addNumber(2);
-    fmt.addComma(); // trailing comma
+    fmt.nextMember(); // trailing comma
     fmt.addComment(" // trailing comma\n");
     fmt.endAggregate();
-    
+
     auto s = fmt.window;
     assert(s == "{\n    'a': 1,\n    b: 2, // trailing comma\n\n}");
 }
@@ -1153,8 +1262,134 @@ unittest
     import std.exception : assertThrown;
 
     auto chain = bufd!char();
-    auto fmt = chain.jsonFormatter;
+    auto fmt = chain.jsonFormatterUT;
 
     assertThrown!JSONIopipeException(fmt.addNumber("01"));
 }
 +/
+
+/**
+  * This is a formatter interface which can be used as a concrete interface for
+  * a JSON writer. This interace can be used as a formatter for the
+  * serialization functions. It abstracts the functionality of the writer for
+  * use in virtual functions. Any valid JSON writer type can be wrapped in
+  * JSONWriterObject (see below).
+  *
+  * Params: JSON5: whether the JSON5 functions are supported
+  */
+interface JSONWriterInterface(bool JSON5)
+{
+    enum hasJSON5 = JSON5;
+    State state() const @property nothrow;
+    size_t position() const @property nothrow;
+    char[] window() @property nothrow;
+    bool inObj() const @property nothrow;
+    size_t depth() const @property nothrow;
+    size_t totalWritten() const @property nothrow;
+    void beginObject();
+    void beginArray();
+    void endAggregate();
+    void beginString();
+    static if(JSON5) void beginString(char quoteChar);
+    void addMemberName(const(char)[] memberName);
+    void addMemberName(T)(T memberName)
+    {
+        addMemberName(memberName.to!string);
+    }
+    static if(JSON5)
+    {
+        void addMemberName(const(char)[] memberName, MemberNameStyle style);
+        void addMemberName(T)(T memberName, MemberNameStyle style)
+        {
+            addMemberName(memberName.to!string, style);
+        }
+    }
+    // always adds escapes
+    void addStringData(const(char)[] data);
+    void addStringData(T)(T data)
+    {
+        addStringData(data.to!string);
+    }
+
+    void endString();
+
+    void addNumber(const(char)[] data);
+    void addNumber(T)(T value, string format = "%s")
+    {
+        static import std.format;
+        addNumber(std.format.format(format, value));
+    }
+
+    void addKeywordValue(KeywordValue value);
+    void addColon();
+
+    void nextMember();
+    void addWhitespace(string data);
+    void addWhitespace(bool validate = false, T)(T data)
+    {
+        static if(validate)
+            static assert(false, "whitespace validation not yet impelmented");
+        auto s = data.to!string;
+        addWhitespace(s);
+    }
+
+    static if(JSON5)
+    {
+        void addComment(bool validate = false, T)(T commentData)
+        {
+            static if(validate)
+                static assert(false, "comment validation not yet impelmented");
+            addComment(commentData.to!string);
+        }
+        void addComment(string commentData);
+    }
+
+    void flushWritten();
+}
+
+/**
+ * Concrete implementation wrapper for a JSON Writer type, which implements the
+ * JSONWriterInterface interface. Useful for creating virtual serialization
+ * functions for classes.
+ */
+final class JSONWriterObject(RealWriter) : JSONWriterInterface!(RealWriter.hasJSON5)
+{
+    private RealWriter* fmt;
+    this(ref RealWriter fmt)
+    {
+        this.fmt = &fmt;
+    }
+
+    State state() const @property nothrow => fmt.state;
+    size_t position() const @property nothrow => fmt.position;
+    char[] window() @property nothrow => fmt.window;
+    bool inObj() const @property nothrow => fmt.inObj;
+    size_t depth() const @property nothrow => fmt.depth;
+    size_t totalWritten() const @property nothrow => fmt.totalWritten;
+    void beginObject() => fmt.beginObject();
+    void beginArray() => fmt.beginArray();
+    void endAggregate() => fmt.endAggregate();
+    void beginString() => fmt.beginString();
+    static if(hasJSON5) void beginString(char quoteChar) => fmt.beginString;
+    void addMemberName(const(char)[] memberName) => fmt.addMemberName(memberName);
+    static if(hasJSON5)
+    {
+        void addMemberName(const(char)[] memberName, MemberNameStyle style) => fmt.addMemberName(memberName, style);
+    }
+    void addStringData(const(char)[] data) => fmt.addStringData(data);
+    void endString() => fmt.endString();
+
+    void addNumber(const(char)[] data) => fmt.addNumber(data);
+    void addKeywordValue(KeywordValue value) => fmt.addKeywordValue(value);
+    void addColon() => fmt.addColon();
+
+    void nextMember() => fmt.nextMember();
+    void addWhitespace(string data) => fmt.addWhitespace(data);
+
+    static if(hasJSON5)
+    {
+        void addComment(string commentData) => fmt.addComment(commentData);
+    }
+
+    void flushWritten() => fmt.flushWritten();
+}

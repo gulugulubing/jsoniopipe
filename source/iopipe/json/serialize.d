@@ -19,6 +19,7 @@
  */
 module iopipe.json.serialize;
 import iopipe.json.parser;
+import iopipe.json.formatter;
 import iopipe.json.dom;
 public import iopipe.json.common;
 import iopipe.traits;
@@ -365,7 +366,6 @@ unittest {
     T t = deserialize!(T)(`"hi"`);
     assert(t.s == "hi");
     assert(t.x == int.init);
-
     assert(t.serialize == `"hi"`);
 
     import std.exception;
@@ -403,7 +403,7 @@ unittest {
     static struct S { X x; Y y; }
     auto s = S(X.a, Y.a);
     auto sstr = s.serialize;
-    assert(sstr == `{"x" : "a", "y" : 0}`);
+    assert(sstr == `{"x":"a","y":0}`);
     auto s2 = sstr.deserialize!S;
     assert(s2.x == X.a && s2.y == Y.a);
 }
@@ -451,8 +451,8 @@ unittest {
 
     T t = deserialize!(T)(`{"alternate": "valid"}`);
     assert(t.name == "valid");
-    assert(t.serialize == `{"alternate" : "valid"}`);
-    deserialize!(T)(`{"name": "invalid"}`).assertThrown;
+    assert(t.serialize == `{"alternate":"valid"}`);
+    deserialize!(T)(`{"name":"invalid"}`).assertThrown;
 }
 
 /**
@@ -489,13 +489,13 @@ unittest {
     assert(t.s == "hi");
     assert(t.x == 1);
 
-    assert(t.serialize == `{"s" : "hi", "x" : 1}`);
+    assert(t.serialize == `{"s":"hi","x":1}`);
 
     deserialize!S(`{"s" : "hi", "x": 1, "extra": "errors"}`).assertThrown!JSONIopipeException;
     auto tt = deserialize!T(`{"s" : "hi", "x": 1, "extra": "errors"}`);
     assert(tt.s == "hi");
     assert(tt.x == 1);
-    assert(tt.serialize == `{"s" : "hi", "x" : 1}`);
+    assert(tt.serialize == `{"s":"hi","x":1}`);
 
 }
 
@@ -1822,15 +1822,14 @@ unittest
     assert(person.age == 30);
 }
 
+/* SERIALIZATION */
 
 struct DefaultSerializationPolicy {
 
 }
 
-
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, ref T val) if (__traits(isStaticArray, T))
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, ref T val) if (__traits(isStaticArray, T))
 {
-    auto arr = val;
     policy.serializeImpl(w, val[]);
 }
 
@@ -1838,10 +1837,10 @@ unittest
 {
     // ensure static array serialization works
     int[5] arr = [1,2,3,4,5];
-    assert(serialize(arr) == "[1, 2, 3, 4, 5]");
+    assert(serialize(arr) == "[1,2,3,4,5]");
 }
 
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, ref T val) if (is(T == enum))
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, ref T val) if (is(T == enum))
 {
     // enums are special, serialize based on the name. Unless there's a UDA
     // saying to serialize as the base type.
@@ -1856,153 +1855,54 @@ void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) 
     }
 }
 
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, T val) if (isDynamicArray!T && !isSomeString!T && !is(T == enum))
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, T val) if (isDynamicArray!T && !isSomeString!T && !is(T == enum))
 {
     // open brace
-    w("[");
-    bool first = true;
+    w.beginArray();
     foreach(ref item; val)
     {
-        if(first)
-            first = false;
-        else
-            w(", ");
+        w.nextMember();
         policy.serializeImpl(w, item);
     }
-    w("]");
+    w.endAggregate();
 }
 
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, T val) if (is(T == V[K], V, K) /* && isSomeString!K */)
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, T val) if (is(T == V[K], V, K) /* && isSomeString!K */)
 {
     assert(is(T == V[K], V, K));
-    enum useKW = !isSomeString!K;
-    // provide a specialized key serialization function if the type is not a string
-    static if(useKW)
-    {
-        // "key write" function. key must always start and end with a quote
-        // (sorry, json5, we are doing it this way for now with AAs)
-        bool keyStart;
-        bool keyEnd;
-        void kw(const(Char)[] str)
-        {
-            if(!keyStart)
-            {
-                // validate that the key starts with "
-                if(str[0] != '"')
-                    throw new JSONIopipeException("Key in AA of type " ~ T.stringof ~ " must serialize to string that starts with a quote");
-                keyStart = true;
-            }
-            keyEnd = str[$-1] == '"';
-            w(str);
-        }
-    }
 
-    // open brace
-    w("{");
-    bool first = true;
+    // serialized as an object
+    w.beginObject();
     foreach(k, v; val)
     {
-        if(first)
-            first = false;
-        else
-            w(", ");
-        static if(useKW)
-        {
-            policy.serializeImpl(&kw, k);
-
-            // validate the key ended
-            if(!keyEnd)
-                throw new JSONIopipeException("Key of type " ~ T.stringof ~ " must serialize to a string that ends with a quote");
-        }
-        else
-            policy.serializeImpl(w, k);
-
-        w(" : ");
+        w.nextMember();
+        w.addMemberName(k);
+        w.addColon();
 
         policy.serializeImpl(w, v);
     }
-    w("}");
+    w.endAggregate();
 }
 
 unittest
 {
     auto serialized = serialize(["a" : 1, "b": 2]);
-    assert(serialized == `{"a" : 1, "b" : 2}` || serialized == `{"b" : 2, "a" : 1}`);
+    assert(serialized == `{"a":1,"b":2}` || serialized == `{"b":2,"a":1}`);
     enum X
     {
         a,
         b
     }
     serialized = serialize([X.a : 1, X.b: 2]);
-    assert(serialized == `{"a" : 1, "b" : 2}` || serialized == `{"b" : 2, "a" : 1}`);
-}
-
-/** Eponymous template that generates an argument list for std.algorithm.substitute to correctly escape json strings
- * Result:
- *      AliasSeq!("<char>", "<escapesequence>", "<char>", "<escapesequence>", ...);
- */
-package template jsonEscapeSubstitutions()
-{
-    import std.algorithm.iteration;
-    import std.range;
-    import std.ascii: ControlChar;
-
-    // Control characters [0,31 aka 0x1f] + 2 special characters '"' and '\'
-    private enum charactersToEscape = chain(only('\\'), iota(0x1f + 1));
-
-    private struct JsonEscapeMapping {
-        char chr;
-        string escapeSequence;
-    }
-
-    /* Special characters we have to (in case of '"' and '\') per the spec or want to escape seperately for readability
-    * Everything else gets converted to the "\uxxxx" unicode escape
-    */
-    private enum JsonEscapeMapping[6] JSON_ESCAPES = [
-        {'\\', `\\`},
-        {ControlChar.bs, `\b`},
-        {ControlChar.lf, `\n`},
-        {ControlChar.cr, `\r`},
-        {ControlChar.tab, `\t`},
-        {ControlChar.ff, `\f`},
-    ];
-
-    private JsonEscapeMapping escapeSingleChar(int c)
-    {
-        import std.format;
-        switch(c)
-        {
-            static foreach(e; JSON_ESCAPES)
-            {
-                case e.chr:
-                    return e;
-            }
-            default:
-                return JsonEscapeMapping(cast(char)c, format!`\u%04x`(c));
-        }
-    }
-
-    // Convert struct to AliasSeq with correct types so it can be used as parameters of a function
-    private template UnpackStruct(JsonEscapeMapping jem)
-    {
-        import std.conv: to;
-        // Must convert char to string for use with substitute
-        enum string staticCast(char c) = c.to!string;
-        enum string staticCast(string s) = s;
-        alias UnpackStruct = staticMap!(staticCast, jem.tupleof);
-    }
-
-    import std.meta;
-    private alias jsonEscapeSubstitutions = staticMap!(UnpackStruct, aliasSeqOf!(charactersToEscape.map!escapeSingleChar));
+    assert(serialized == `{"a":1,"b":2}` || serialized == `{"b":2,"a":1}`);
 }
 
 /// Instantiate the template without arguments so it's not necessary at the callsite anymore
-void serializeImpl(P, T, Char)(ref P Policy, scope void delegate(const(Char)[]) w, T val) if (isSomeString!T)
+void serializeImpl(P, T, Writer)(ref P Policy, ref Writer w, T val) if (isSomeString!T)
 {
-    import std.algorithm.iteration: substitute;
-    w(`"`);
-    put(w, val.substitute(jsonEscapeSubstitutions!(), `"`, `\"`));
-    w(`"`);
+    w.beginString();
+    w.addStringData(val);
+    w.endString();
 }
 
 // Escape special characters
@@ -2027,10 +1927,12 @@ unittest
     assert(raw.serialize.deserialize!string == raw);
 }
 
-void serializeAllMembers(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, auto ref T val)
+void serializeAllMembers(P, T, Writer)(ref P policy, ref Writer w, auto ref T val)
 {
+    // must be in an object
+    assert(w.inObj);
+
     // serialize as an object
-    bool first = true;
     static foreach(n; SerializableMembers!T)
     {
         static if(hasUDA!(__traits(getMember, T, n), extras))
@@ -2038,46 +1940,38 @@ void serializeAllMembers(P, T, Char)(ref P policy, scope void delegate(const(Cha
             // this is the extras member, It should be an object, with all the information inside there.
             foreach(k, ref v; __traits(getMember, val, n).object)
             {
-                if(first)
-                    first = false;
-                else
-                    w(", ");
-                w(`"`);
-                w(k);
-                w(`" : `);
-                serializeImpl(w, v);
+                w.nextMember();
+                w.addMemberName(k);
+                w.addColon();
+                policy.serializeImpl(w, v);
             }
         }
         else
         {
-            if(first)
-                first = false;
-            else
-                w(", ");
-            w(`"`);
+            w.nextMember();
             static if(hasUDA!(__traits(getMember, T, n), alternateName))
-                w(getUDAs!(__traits(getMember, T, n), alternateName)[0].name);
+                w.addMemberName(getUDAs!(__traits(getMember, T, n), alternateName)[0].name);
             else
-                w(n);
-            w(`" : `);
+                w.addMemberName(n);
+            w.addColon();
             policy.serializeImpl(w, __traits(getMember, val, n));
         }
     }
 }
 
 ///compatibility shim
-void serializeAllMembers(T, Char)(scope void delegate(const(Char)[]) w, auto ref T val)
+void serializeAllMembers(T, Writer)(ref Writer w, auto ref T val)
 {
     auto policy = DefaultSerializationPolicy;
     serializeAllmembers(policy, w, val);
 }
 
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, ref T val) if (is(T == struct))
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, ref T val) if (is(T == struct))
 {
     static if(isInstanceOf!(Nullable, T))
     {
         if(val.isNull)
-            w("null");
+            w.addKeywordValue(KeywordValue.Null);
         else
             policy.serializeImpl(w, val.get);
     }
@@ -2098,35 +1992,20 @@ void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) 
             policy.serializeImpl(w, val.array);
             break;
         case Obj:
-            // serialize as if it was an object
-            w("{");
-            {
-                bool first = true;
-                foreach(k, ref v; val.object)
-                {
-                    if(first)
-                        first = false;
-                    else
-                        w(", ");
-                    w(`"`);
-                    w(k);
-                    w(`" : `);
-                    policy.serializeImpl(w, v);
-                }
-            }
-            w("}");
+            policy.serializeImpl(w, val.object);
             break;
         case Null:
-            w("null");
+            policy.serializeImpl(w, null);
             break;
         case Bool:
-            w(val.boolean ? "true" : "false");
+            policy.serializeImpl(w, val.boolean);
+            w.addKeywordValue(val.boolean ? KeywordValue.True : KeywordValue.False);
             break;
         }
     }
     else static if(__traits(hasMember, T, "toJSON"))
     {
-        val.toJSON(w);
+        val.toJSON(policy, w);
     }
     else static if(getSymbolsByUDA!(T, serializeAs).length > 0)
     {
@@ -2138,44 +2017,40 @@ void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) 
     else static if(isInputRange!T)
     {
         // open brace
-        w("[");
-        bool first = true;
+        w.beginArray();
         foreach(ref item; val)
         {
-            if(first)
-                first = false;
-            else
-                w(", ");
+            w.nextMember();
             policy.serializeImpl(w, item);
         }
-        w("]");
+        w.endAggregate();
     }
     else
     {
-        w("{");
+        w.beginObject();
         policy.serializeAllMembers(w, val);
-        w("}");
+        w.endAggregate();
     }
 }
 
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, T val) if (is(T == class) || is(T == interface))
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, T val) if (is(T == class) || is(T == interface))
 {
     if(val is null)
     {
-        w("null");
+        w.addKeywordValue(KeywordValue.Null);
         return;
     }
     // If the class defines a method toJSON, then use that. Otherwise, we will
     // just serialize the data as we can.
     static if(__traits(hasMember, T, "toJSON"))
     {
-        val.toJSON(w);
+        val.toJSON(policy, w);
     }
     else
     {
-        w("{");
+        w.beginObject();
         policy.serializeAllMembers(w, val);
-        w("}");
+        w.endAggregate();
     }
 }
 
@@ -2190,13 +2065,13 @@ unittest
     }
 
     S s;
-    assert(serialize(s) == `{"c" : null}`);
+    assert(serialize(s) == `{"c":null}`);
 }
 
 
-void serializeImpl(P, Char)(ref P policy, scope void delegate(const(Char)[]) w, typeof(null) val)
+void serializeImpl(P, Writer)(ref P policy, ref Writer w, typeof(null) val)
 {
-    w("null");
+    w.addKeywordValue(KeywordValue.Null);
 }
 
 // allow serializing null
@@ -2206,17 +2081,17 @@ unittest
         typeof(null) n;
     }
     S s;
-    assert(serialize(s) == `{"n" : null}`);
+    assert(serialize(s) == `{"n":null}`);
 }
 
-void serializeImpl(P, T, Char)(ref P policy, scope void delegate(const(Char)[]) w, ref T val) if (!is(T == enum) && isNumeric!T)
+void serializeImpl(P, T, Writer)(ref P policy, ref Writer w, ref T val) if (!is(T == enum) && isNumeric!T)
 {
-    formattedWrite(w, "%s", val);
+    w.addNumber(val);
 }
 
-void serializeImpl(P, Char)(ref P policy, scope void delegate(const(Char)[]) w, bool val)
+void serializeImpl(P, Writer)(ref P policy, ref Writer w, bool val)
 {
-    w(val ? "true" : "false");
+    w.addKeywordValue(val ? KeywordValue.True : KeywordValue.False);
 }
 
 // serialize an item to an iopipe.
@@ -2235,26 +2110,25 @@ void serializeImpl(P, Char)(ref P policy, scope void delegate(const(Char)[]) w, 
 // elements that are in the buffer. If offset is specified, then that is where
 // the data will begin to be written.
 //
-size_t serialize(ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes, Chain, T)(auto ref Chain chain, auto ref T val, size_t offset = 0)
-if (isIopipe!Chain && isSomeChar!(ElementType!(WindowType!Chain)))
+size_t serialize(ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes, Chain, T)(auto ref Chain chain, auto ref T val, size_t offset)
 {
-    size_t result = 0;
-    alias Char = ElementEncodingType!(WindowType!Chain);
-    void w(const(Char)[] data)
-    {
-        auto nWritten = chain.writeBuf!relOnWrite(data, offset);
-        result += nWritten;
-        static if(relOnWrite)
-            offset = 0;
-        else
-            offset += nWritten;
-    }
+    static assert (isIopipe!Chain && isSomeChar!(ElementType!(WindowType!Chain)));
+    return serialize!relOnWrite(chain.jsonWriter!(false, relOnWrite)(offset), val);
+}
+
+size_t serialize(ReleaseOnWrite relOnWrite = ReleaseOnWrite.yes, Chain, T)(auto ref Chain chain, auto ref T val)
+{
+    static if (isIopipe!Chain && isSomeChar!(ElementType!(WindowType!Chain)))
+        auto writer = chain.jsonWriter!(false, relOnWrite);
+    else
+        // assume the writer is the the passed-in chain paramter
+        alias writer = chain;
 
     // serialize the item, recursively
     auto policy = DefaultSerializationPolicy();
-    serializeImpl(policy, &w, val);
+    serializeImpl(policy, writer, val);
 
-    return result;
+    return writer.totalWritten;
 }
 
 // convenience, using normal serialization to write to a string.
@@ -2277,12 +2151,12 @@ unittest
     strpipe.deserialize(item1);
     assert(item1 == 1);
     auto str2 = serialize([1,2,3,4]);
-    assert(str2 == "[1, 2, 3, 4]");
+    assert(str2 == "[1,2,3,4]");
     int[4] item2;
     strpipe = str2;
     strpipe.deserialize(item2);
     assert(item2[] == [1, 2, 3, 4]);
-    assert(str2 == "[1, 2, 3, 4]");
+    assert(str2 == "[1,2,3,4]");
     static struct S
     {
         int x;
@@ -2291,11 +2165,11 @@ unittest
         bool b;
     }
 
-    assert(serialize(S(1, 2.5, "hi", true)) == `{"x" : 1, "y" : 2.5, "s" : "hi", "b" : true}`);
+    assert(serialize(S(1, 2.5, "hi", true)) == `{"x":1,"y":2.5,"s":"hi","b":true}`);
 
     // serialize nested arrays and objects
     auto str3 = serialize([S(1, 3.0, "foo", false), S(2, 8.5, "bar", true)]);
-    assert(str3 == `[{"x" : 1, "y" : 3, "s" : "foo", "b" : false}, {"x" : 2, "y" : 8.5, "s" : "bar", "b" : true}]`, str3);
+    assert(str3 == `[{"x":1,"y":3,"s":"foo","b":false},{"x":2,"y":8.5,"s":"bar","b":true}]`, str3);
     auto arr = str3.deserialize!(S[]);
     assert(arr.length == 2);
     assert(arr[0].s == "foo");
@@ -2313,7 +2187,7 @@ unittest
 
     auto s = S(1, true);
     auto str = s.serialize;
-    assert(str == `{"x" : 1}`, str);
+    assert(str == `{"x":1}`, str);
 
     static struct T
     {
@@ -2327,7 +2201,7 @@ unittest
     }
     auto u = U(T("hello", 1));
     auto str2 = u.serialize;
-    assert(str2 == `{"t" : "hello"}`, str2);
+    assert(str2 == `{"t":"hello"}`, str2);
 }
 
 unittest
@@ -2341,47 +2215,52 @@ unittest
     static class D : C
     {
         string s;
-        void toJSON(scope void delegate(const(char)[]) w)
+        void toJSON(Writer)(DefaultSerializationPolicy policy, ref Writer w)
         {
-            //FIXME: should this be needed?
-            auto policy = DefaultSerializationPolicy();
-
-            w("{");
+            // serialize using a wrapped json object
+            static if(is(Writer : JSONWriterInterface!false))
+                return toJSONImpl(policy, w);
+            // wrap the json object to get everything virtual
+            static assert(!w.hasJSON5, "doesn't support json5!");
+            scope tmpFormatter = new JSONWriterObject!Writer(w);
+            toJSONImpl(policy, tmpFormatter);
+        }
+        protected void toJSONImpl(DefaultSerializationPolicy policy, JSONWriterInterface!false w)
+        {
+            w.beginObject();
             policy.serializeAllMembers(w, this);
-            w("}");
+            w.endAggregate();
         }
     }
 
     static class E : D
     {
         double d;
-        override void toJSON(scope void delegate(const(char)[]) w)
+        override void toJSONImpl(DefaultSerializationPolicy policy, JSONWriterInterface!false w)
         {
-            //FIXME: should this be needed?
-            auto policy = DefaultSerializationPolicy();
-            w("{");
+            w.beginObject();
             policy.serializeAllMembers(w, this);
-            w("}");
+            w.endAggregate();
         }
     }
 
     auto c = new C;
     c.x = 1;
     auto cstr = c.serialize;
-    assert(cstr == `{"x" : 1}`, cstr);
+    assert(cstr == `{"x":1}`, cstr);
 
     auto d = new D;
     d.x = 2;
     d.s = "str";
     auto dstr = d.serialize;
-    assert(dstr == `{"s" : "str", "x" : 2}`, dstr);
+    assert(dstr == `{"s":"str","x":2}`, dstr);
 
     auto e = new E;
     e.x = 3;
     e.s = "foo";
     e.d = 1.5;
     auto estr = e.serialize;
-    assert(estr == `{"d" : 1.5, "s" : "foo", "x" : 3}`, estr);
+    assert(estr == `{"d":1.5,"s":"foo","x":3}`, estr);
     d = e;
     assert(d.serialize == estr);
 }
@@ -2390,7 +2269,7 @@ unittest
 {
     // test serializing JSONValue
     auto j = deserialize!(JSONValue!string)(`{"a": [1, 2, 3], "b": null}`);
-    assert(j.serialize == `{"a" : [1, 2, 3], "b" : null}`);
+    assert(j.serialize == `{"a":[1,2,3],"b":null}`);
 }
 
 // JSON5 tests
@@ -2611,5 +2490,5 @@ unittest
 	import std.range;
 	import std.algorithm;
 
-	assert(iota(10).map!"a+1".serialize == "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]");
+	assert(iota(10).map!"a+1".serialize == "[1,2,3,4,5,6,7,8,9,10]");
 }
